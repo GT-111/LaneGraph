@@ -1,6 +1,6 @@
 # Python cache, compiled files
 *.pyc
-**/__pycache__/*
+**/__pycache__
 
 # IDE files
 **/.vscode/*
@@ -17,3 +17,11 @@ validation_laneExtraction*/*
 
 # Pytorch Files
 *.pth
+
+# Dataset
+raw_data/
+processed_data/
+# Logs
+logs/
+
+
