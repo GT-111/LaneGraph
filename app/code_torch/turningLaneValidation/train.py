@@ -1,121 +1,180 @@
+from dataloader import Dataloader, ParallelDataLoader
+from model import LinkModel
+
+import os
 import sys
-from pathlib import Path
 
-sys.path.append(str(Path(__file__).parents[3]))
+sys.path.append(os.path.dirname(os.path.dirname(sys.path[0])))
+
+from framework.training import TrainingFramework
 
 
-import cv2
+from PIL import Image
 import numpy as np
-import torch
-from dataloader import TurnValDataloader
-
-from app.code_torch.framework import base_classes, utils
-from app.code_torch.turningLaneValidation.model_manager import TurnValModelManager
-
-torch.autograd.set_detect_anomaly(True)
+from subprocess import Popen
+import tensorflow as tf
+import math
+import json
 
 
-class TurnValTrainer(base_classes.Trainer):
-    def __init__(
-        self,
-        config: base_classes.Config,
-        dataloader: base_classes.DataLoader,
-        model_manager: base_classes.ModelManager,
-    ) -> None:
-        super().__init__(config, dataloader, model_manager)
+class Train(TrainingFramework):
+    def __init__(self, mode="seg"):
+        self.mode = mode
+        self.image_size = 640
+        self.batch_size = 8
+        self.datafolder = "../dataset_training"
+        self.training_range = []
+        dataset_split = json.load(open("../split_all.json"))
 
-    def _add_log(self, step: int, results: tuple) -> None:
-        logs = {
-            "loss": results[0],
-            "seg_loss": results[1],
-            "class_loss": results[2],
-        }
-        for key, value in logs.items():
-            if key in self.logs:
-                self.logs[key].append(value)
-            else:
-                self.logs[key] = [value]
-        return
+        for tid in dataset_split["training"]:
+            for i in range(9):
+                self.training_range.append("_%d" % (tid * 9 + i))
 
-    def _visualize(self, epoch: int, step: int, batch: tuple, result: tuple):
-        path = self.config.visualization_folder
+        self.instance = "_turningLaneValidation_run1_640_resnet34_500ep" + self.mode
 
-        image_size = batch[0].shape[1]
-        batch_size = batch[0].shape[0]
+        # self.instance = "link_run6_640_resnet34v3" # gt direction
+        self.modelfolder = "model" + self.instance
+        self.validationfolder = "validation" + self.instance
 
-        direction_image = np.zeros((image_size, image_size, 3))
+        Popen("mkdir " + self.modelfolder, shell=True).wait()
+        Popen("mkdir " + self.validationfolder, shell=True).wait()
 
-        for i in range(batch_size):
-            id_str = f"{epoch}_{step}_{i}"
+        self.counter = 0
+        self.disloss = 0
 
-            # Saving Batch
-            cv2.imwrite(
-                str(path / f"{id_str}_input.jpg"),
-                ((batch[0][i, :, :, :] + 0.5) * 255).astype(np.uint8),
-            )
-            cv2.imwrite(
-                str(path / f"{id_str}_connector1.jpg"),
-                ((batch[1][i, :, :, 0:3]) * 127 + 127).astype(np.uint8),
-            )
-            cv2.imwrite(
-                str(path / f"{id_str}_connector2.jpg"),
-                ((batch[1][i, :, :, 3:6]) * 127 + 127).astype(np.uint8),
-            )
-            cv2.imwrite(
-                str(path / f"{id_str}_target1.jpg"),
-                ((batch[2][i, :, :, 1]) * 255).astype(np.uint8),
-            )
-            cv2.imwrite(
-                str(path / f"{id_str}_target2.jpg"),
-                ((batch[2][i, :, :, 2]) * 255).astype(np.uint8),
-            )
+        self.epochsize = (
+            len(self.training_range)
+            * 2048
+            * 2048
+            / (self.batch_size * self.image_size * self.image_size)
+        )
 
-            # Saving Results
-            # sw ind
-            cv2.imwrite(
-                str(path / f"{id_str}_output1.jpg"),
-                ((result[3][i, 0, :, :]) * 255).astype(np.uint8),
-            )
-            cv2.imwrite(
-                str(path / f"{id_str}_output2.jpg"),
-                ((result[3][i, 1, :, :]) * 255).astype(np.uint8),
-            )
-            with open(path / f"{id_str}_label.txt", "w") as txt_file:
-                txt_file.write(f"{batch[3][i, 0]} {result[4][i, 0]} \n")
+        pass
 
-            direction_image[:, :, 2] = np.clip(batch[4][i, :, :, 0], -1, 1) * 127 + 127
-            direction_image[:, :, 1] = np.clip(batch[4][i, :, :, 1], -1, 1) * 127 + 127
-            direction_image[:, :, 0] = 127
+    def createDataloader(self, mode):
+        self.dataloader = ParallelDataLoader(
+            self.datafolder, self.training_range, image_size=self.image_size
+        )
+        self.dataloader.preload()
+        return self.dataloader
 
-            direction_image[:, :, 0] += batch[1][i, :, :, 0] * 255 + 127
-            direction_image[:, :, 1] += batch[1][i, :, :, 3] * 255 + 127
-            direction_image[:, :, 2] += batch[1][i, :, :, 6] * 255 + 127
+    def createModel(self, sess):
+        self.model = LinkModel(sess, self.image_size, batchsize=self.batch_size)
 
-            direction_image = np.clip(direction_image, 0, 255)
+        return self.model
 
-            cv2.imwrite(
-                str(path / f"{id_str}_direction.jpg"), direction_image.astype(np.uint8)
-            )
+    def getBatch(self, dataloader):
+        return dataloader.getBatch(self.batch_size)
+
+    def train(self, batch, lr):
+        self.counter += 1
+
+        ret = self.model.train(batch[0], batch[1], batch[2], batch[3], batch[4], lr)
+
+        return ret
+
+    def preload(self, dataloader, step):
+        if step > 0 and step % 50 == 0:
+            dataloader.preload()
+
+    # placeholder methods
+    def getLoss(self, result):
+        if math.isnan(result[0]):
+            print("loss is nan ...")
+            exit()
+
+        self.logvalue("segloss", result[1])
+        self.logvalue("classloss", result[2])
+
+        return result[0]
+
+    def getProgress(self, step):
+        return step / float(self.epochsize)
+
+    def saveModel(self, step):
+        if step % (self.epochsize * 5) == 0:
+            self.model.saveModel(self.modelfolder + "/model%d" % step)
+        return False
+
+    def visualization(self, step, result=None, batch=None):
+        direction_img = np.zeros((self.image_size, self.image_size, 3))
+
+        if step % 100 == 0:
+            ind = ((step // 100) * self.batch_size) % 128
+            for i in range(self.batch_size):
+                Image.fromarray(
+                    ((batch[0][i, :, :, :] + 0.5) * 255).astype(np.uint8)
+                ).save(self.validationfolder + "/input%d.jpg" % (ind + i))
+                Image.fromarray(
+                    ((batch[1][i, :, :, 0:3]) * 127 + 127).astype(np.uint8)
+                ).save(self.validationfolder + "/connector1%d.jpg" % (ind + i))
+                Image.fromarray(
+                    ((batch[1][i, :, :, 3:6]) * 127 + 127).astype(np.uint8)
+                ).save(self.validationfolder + "/connector2%d.jpg" % (ind + i))
+
+                Image.fromarray(((batch[2][i, :, :, 1]) * 255).astype(np.uint8)).save(
+                    self.validationfolder + "/target1%d.jpg" % (ind + i)
+                )
+                Image.fromarray(((result[3][i, :, :, 0]) * 255).astype(np.uint8)).save(
+                    self.validationfolder + "/output1%d.jpg" % (ind + i)
+                )
+                Image.fromarray(((batch[2][i, :, :, 2]) * 255).astype(np.uint8)).save(
+                    self.validationfolder + "/target2%d.jpg" % (ind + i)
+                )
+                Image.fromarray(((result[3][i, :, :, 1]) * 255).astype(np.uint8)).save(
+                    self.validationfolder + "/output2%d.jpg" % (ind + i)
+                )
+
+                with open(
+                    self.validationfolder + "/label%d.txt" % (ind + i), "w"
+                ) as fout:
+                    fout.write("%f %f \n" % (batch[3][i, 0], result[4][i, 0]))
+
+                def norm(x):
+                    # return x
+                    amin = np.amin(x)
+                    amin = 0
+                    amax = np.amax(x)
+
+                    x = (x - amin) / max(0.00001, (amax - amin))
+                    return x
+
+                direction_img[:, :, 2] = (
+                    np.clip(batch[4][i, :, :, 0], -1, 1) * 127 + 127
+                )
+                direction_img[:, :, 1] = (
+                    np.clip(batch[4][i, :, :, 1], -1, 1) * 127 + 127
+                )
+                direction_img[:, :, 0] = 127
+
+                direction_img[:, :, 0] += batch[1][i, :, :, 0] * 255 + 127
+                direction_img[:, :, 1] += batch[1][i, :, :, 3] * 255 + 127
+                direction_img[:, :, 2] += batch[1][i, :, :, 6] * 255 + 127
+
+                direction_img = np.clip(direction_img, 0, 255)
+
+                Image.fromarray(direction_img.astype(np.uint8)).save(
+                    self.validationfolder + "/direction%d.jpg" % (ind + i)
+                )
+
+        return False
 
 
-root_dir = utils.get_git_report()
+if __name__ == "__main__":
+    # trainer = Train(sys.argv[1])
+    trainer = Train()
 
-dataset_path = root_dir / "msc_dataset" / "dataset_unpacked"
+    epochsisze = trainer.epochsize
 
-split_file = root_dir / "app" / "code" / "split_all.json"
+    config = {}
+    config["learningrate"] = 0.0001
+    config["lr_decay"] = [0.1, 0.1]
+    config["lr_decay_step"] = [epochsisze * 350, epochsisze * 450]
 
-config = base_classes.Config(1, 1, dataset_path, split_file)
+    config["step_init"] = 0
+    config["step_max"] = epochsisze * 500 + 1
 
-dataloader = base_classes.ParallelDataLoader(
-    1,
-    1,
-    2,
-    TurnValDataloader,
-    training_range=config.training_range,
-    dataset_folder=config.dataset_folder,
-)
+    config["use_validation"] = False
+    config["logfile"] = "log_%s.json" % trainer.instance
 
-model_manager = TurnValModelManager(config)
-
-trainer = TurnValTrainer(config, dataloader, model_manager)
-trainer.run()
+    trainer.run(config)

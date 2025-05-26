@@ -4,13 +4,14 @@ import threading
 import scipy.ndimage 
 from time import time 
 import random 
-import cv2 
+import cv2
 import json
 import math
 
 global_lock = threading.Lock()
 
 def rotate(pos, angle, size):
+	
 	x = pos[0] - int(size/2)
 	y = pos[1] - int(size/2)
 
