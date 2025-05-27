@@ -4,8 +4,6 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as TF
-import cv2
-
 
 def lanegraph_collate_fn(batch):
     keys = batch[0].keys()
@@ -73,7 +71,7 @@ class LaneGraphDataset(Dataset):
         ax.scatter(xs, ys, s=10, c='red', label='nodes')
         ys, xs = np.where(edge_prob > 0.5)
         for x, y in zip(xs[::skip], ys[::skip]):
-            dx, dy = edge_vector[:, y, x]
+            dx, dy = edge_vector[0, y, x].item(), edge_vector[1, y, x].item()
             ax.arrow(x, y, dx * 6, dy * 6, head_width=2, color='blue', alpha=0.6)
         ax.imshow(seg_mask, alpha=0.3)
         ax.axis('off')
@@ -116,5 +114,7 @@ class LaneGraphDataset(Dataset):
             plt.show()
 
 if __name__ == "__main__":
+    vis_dir = '/mnt/c/Users/hg25079/Documents/GitHub/LaneGraph/visualizations'
     dataset = LaneGraphDataset("processed_data")
-    dataset.visualize_sample(idx=0)
+    idx = 8
+    dataset.visualize_sample(idx=idx, save_path=os.path.join(vis_dir, f"sample_{idx}.png"))

@@ -46,7 +46,7 @@ def resample_polyline(coords, spacing):
 
 
 def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir,
-                    patch_size=640, tile_size=4096, stride=4096, resample_spacing=20, lane_width=5):
+                    patch_size=640, tile_size=4096, stride=4096, resample_spacing=30, lane_width=5, min_nodes=50):
     Path(processed_data_path).mkdir(parents=True, exist_ok=True)
     Path(vis_dir).mkdir(parents=True, exist_ok=True)
     margin = 128
@@ -83,7 +83,7 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
                         sat_crop = img[sr:sr + patch_size, sc:sc + patch_size, :]
                         sat_padded = np.zeros((patch_size + 2 * margin, patch_size + 2 * margin, 3), dtype=np.uint8)
                         sat_padded[margin:margin + patch_size, margin:margin + patch_size] = sat_crop
-
+                        vis_img = sat_padded.copy()
                         local_nodes = {}
                         local_edges = []
                         node_pos_cache = {}
@@ -104,8 +104,8 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
                                 p1 = node_pos_cache[nid]
                                 p2 = node_pos_cache[nn]
 
-                                node_type = 'link' if node_types.get(nid) == 'link' or node_types.get(nn) == 'link' else 'way'
                                 edge_type = edge_types.get((nid, nn)) or edge_types.get((nn, nid))
+                                node_type = 'link' if edge_type =='link' else 'way'
                                 if edge_type is None:
                                     continue
 
@@ -118,20 +118,18 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
 
                                 resampled = resample_polyline(coords, resample_spacing)
                                 prev_id = None
-                                entered_patch = False
-                                for i, pt in enumerate(resampled):
+                                for idx, pt in enumerate(resampled):
                                     within_patch = margin <= pt[0] < patch_size + margin and margin <= pt[1] < patch_size + margin
-                                    if within_patch and not entered_patch:
-                                        prev_id = nid
-                                        entered_patch = True
-                                        local_nodes[prev_id] = {"pos": list(pt), "type": node_type}
-                                        continue
-                                    if entered_patch:
-                                        curr_id = next_virtual_id
-                                        local_nodes[curr_id] = {"pos": list(pt), "type": node_type}
-                                        next_virtual_id += 1
-                                        local_edges.append({"from": prev_id, "to": curr_id, "type": edge_type})
-                                        prev_id = curr_id
+                                    if within_patch:
+                                        if prev_id is None:
+                                            prev_id = nid
+                                            local_nodes[prev_id] = {"pos": list(pt), "type": node_type}
+                                        else:
+                                            curr_id = next_virtual_id
+                                            local_nodes[curr_id] = {"pos": list(pt), "type": node_type}
+                                            next_virtual_id += 1
+                                            local_edges.append({"from": prev_id, "to": curr_id, "type": edge_type})
+                                            prev_id = curr_id
 
                         # prepare training targets
                         H = W = patch_size + 2 * margin
@@ -144,16 +142,7 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
                         edge_class = torch.zeros((3, H, W))
                         segmentation = torch.zeros((1, H, W))
                         topo_tensor = torch.zeros((7, H, W))
-
-                        for nid, node in local_nodes.items():
-                            x, y = map(int, node["pos"])
-                            draw_gaussian(node_heatmap[0], (x, y), radius=2)
-                            node_type[0 if node["type"] == "way" else 1, y, x] = 1
-                            disk = np.zeros((H, W), dtype=np.uint8)
-                            cv2.circle(disk, (x, y), radius=4, color=1, thickness=-1)
-                            segmentation[0] += torch.from_numpy(disk)
-                            topo_tensor[1, y, x] = 1
-
+                        
                         for edge in local_edges:
                             x1, y1 = local_nodes[edge["from"]]["pos"]
                             x2, y2 = local_nodes[edge["to"]]["pos"]
@@ -167,6 +156,8 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
 
                             mask = np.zeros((H, W), dtype=np.uint8)
                             cv2.line(mask, (int(x1), int(y1)), (int(x2), int(y2)), color=1, thickness=lane_width)
+                            color = map_edge_type_to_color(edge["type"])
+                            cv2.line(vis_img, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                             ys, xs = np.where(mask > 0)
                             for x, y in zip(xs, ys):
                                 segmentation[0, y, x] = 1
@@ -177,6 +168,29 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
                                 edge_vector[:, y, x] = torch.tensor([dx_norm, dy_norm])
                                 topo_tensor[3, y, x] = dx_norm
                                 topo_tensor[4, y, x] = dy_norm
+                                
+                        for nid, node in local_nodes.items():
+                            x, y = map(int, node["pos"])
+                            draw_gaussian(node_heatmap[0], (x, y), radius=2)
+                            node_type[0 if node["type"] == "way" else 1, y, x] = 1
+                            disk = np.zeros((H, W), dtype=np.uint8)
+                            cv2.circle(disk, (x, y), radius=4, color=1, thickness=-1)
+                            segmentation[0] += torch.from_numpy(disk)
+                            topo_tensor[1, y, x] = 1
+                            
+                            color = map_node_type_to_color(node["type"])
+                            cv2.circle(vis_img, (int(x), int(y)), 3, color, -1)
+                        
+                        node_cnt_in_sat = sum(
+                            1
+                            for v in local_nodes.values()
+                            if margin <= v["pos"][0] < patch_size + margin
+                            and margin <= v["pos"][1] < patch_size + margin
+                        )
+
+                        if node_cnt_in_sat < min_nodes:
+                            continue  # skip low-quality samples
+                        
 
                         np.save(os.path.join(processed_data_path, f"sample_{counter_out:05d}.npy"), {
                             "global_id": f"{counter_out}",
@@ -193,15 +207,32 @@ def preprocess_all(region_json_path, raw_data_path, processed_data_path, vis_dir
                             "topo_tensor": topo_tensor.numpy()
                         }, allow_pickle=True)
                         counter_out += 1
-                
+                        cv2.imwrite(os.path.join(vis_dir, f"vis_{counter_out}.jpg"), vis_img)
 
     print("✅ Preprocessing complete. Total samples:", counter_out)
 
-
+def map_node_type_to_color(node_type):
+    if node_type == "way":
+        return (255, 0, 0)
+    elif node_type == "link":
+        return (0, 255, 255)
+    elif node_type == "terminal":
+        return (0, 0, 255)
+    else:
+        raise ValueError(f"Unknown node type: {node_type}")
+    
+def map_edge_type_to_color(edge_type):
+    if edge_type == "way":
+        return (0, 255, 0)  
+    elif edge_type == "link":
+        return (0, 0, 255)
+    else:
+        raise ValueError(f"Unknown edge type: {edge_type}")
+    
 if __name__ == "__main__":
     raw_data_path = '/mnt/c/Users/hg25079/Documents/GitHub/LaneGraph/raw_data'
     processed_data_path = '/mnt/c/Users/hg25079/Documents/GitHub/LaneGraph/processed_data'
-    vis_dir = '/mnt/c/Users/hg25079/Documents/GitHub/LaneGraph/visualizations'
+    vis_dir = '/mnt/c/Users/hg25079/Documents/GitHub/LaneGraph/processed_data/visualizations'
     region_json_path = '/mnt/c/Users/hg25079/Documents/GitHub/LaneGraph/raw_data/regions.json'
     preprocess_all(
         region_json_path=region_json_path,
